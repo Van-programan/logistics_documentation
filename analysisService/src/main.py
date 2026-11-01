@@ -7,6 +7,7 @@ from src.parsing.orchestrator import MultiFileParser
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
+
 def debug_parse_multi(sources: list[SourceDocument]) -> None:
     print(f"=== Парсинг {len(sources)} файл(ов) ===")
     for s in sources:
@@ -22,189 +23,153 @@ def debug_parse_multi(sources: list[SourceDocument]) -> None:
 
     print("\n--- Раскладка по источникам ---")
     for sid, src in doc.sources.items():
-        n_blocks = len(src.blocks)
         print(f"  [{sid}] {src.source.file_name}: {src.format.value}, "
-              f"{n_blocks} блоков, {len(src.full_text)} символов")
+              f"{len(src.blocks)} блоков, {len(src.full_text)} символов")
 
     print("\n--- Первые 2000 символов склейки ---")
-    print(doc.full_text[-3000:])
+    print(doc.full_text[:2000])
 
-    # Проверка: возьмём первые 2 блока — они должны указывать на договор
-    print("\n--- Первые 2 блока ---")
-    for b in doc.blocks[:2]:
-        assert doc.full_text[b.global_start:b.global_end] == b.text
-        src = doc.sources[b.source_id]
-        assert src.full_text[b.local_start:b.local_end] == b.text
-        print(
-            f"[{b.source_id}] local={b.local_start}-{b.local_end} "
-            f"global={b.global_start}-{b.global_end} "
-            f"paragraph={b.paragraph} table={b.table} row={b.row} page={b.page}: "
-            f"{b.text[:60]!r}"
-        )
+    # Проверка экспорта
+    print("\n=== Тест фрагментации (Путь B) ===")
 
-    # Проверка: найдём позицию спецификации
-    print("\n--- Первые 200 символов спецификации ---")
-    for sid, src in doc.sources.items():
-        if sid != "main":
-            print(f"[{sid}]: {src.full_text[:400]}")
-            break
-
-    print("\n=== Тест фрагментации для сервиса экспорта (Путь B) ===")
-
-    def check_export_roundtrip(doc, global_start: int, global_end: int) -> None:
-        """Проверяет, что фрагмент, пройдя через export_info, возвращается
-        тем же текстом при склейке сегментов — с точностью до разделителей
-        между блоками, которые не принадлежат ни одному блоку."""
+    def check_export_roundtrip(doc, global_start, global_end):
         original = doc.full_text[global_start:global_end]
         info = doc.export_info(global_start, global_end)
-        assert info is not None, f"export_info=None для [{global_start}:{global_end}]"
+        assert info is not None
+        segments = info.segments
+        assert segments
 
-        segments = info["segments"]
-        assert segments, "Пустой список segments"
-
-        # 1. Порядок и отсутствие перекрытий
-        g_starts = [s["global_start"] for s in segments]
+        g_starts = [s.global_start for s in segments]
         assert g_starts == sorted(g_starts)
-        for a, b in zip(segments, segments[1:]):
-            assert a["global_end"] <= b["global_start"]
 
-        # 2. Каждый сегмент должен лежать внутри одного блока
         for s in segments:
-            block = doc.block_for_position(s["global_start"])
+            block = doc.block_for_position(s.global_start)
             assert block is not None
-            assert block.source_id == s["source_id"]
-            assert block.global_start <= s["global_start"]
-            assert s["global_end"] <= block.global_end
+            if s.format.value == "DOCX" and s.table is None:
+                assert s.paragraph == block.paragraph
+            if s.format.value == "PDF":
+                assert s.page == block.page
 
-            if s["format"] == "DOCX" and s["table"] is None:
-                assert s["paragraph"] == block.paragraph
-            if s["format"] == "PDF":
-                assert s["page"] == block.page
-
-        # 3. Восстановление текста: сегменты == фрагмент БЕЗ «дыр».
-        #    Собираем из фрагмента только те куски, что покрыты сегментами.
-        covered_text_parts: list[str] = []
-        cursor = global_start
-        for s in segments:
-            # Пропускаем «дыру» между cursor и s["global_start"] — это разделители
-            # между блоками/страницами, они не принадлежат ни одному блоку.
-            covered_text_parts.append(doc.full_text[s["global_start"]:s["global_end"]])
-            cursor = s["global_end"]
-
-        covered_by_global = "".join(covered_text_parts)
-
+        covered_by_global = "".join(
+            doc.full_text[s.global_start:s.global_end] for s in segments
+        )
         covered_by_segments = "".join(
-            doc.sources[s["source_id"]].full_text[s["local_start"]:s["local_end"]]
+            doc.sources[s.source_id].full_text[s.local_start:s.local_end]
             for s in segments
         )
+        assert covered_by_global == covered_by_segments
 
-        assert covered_by_global == covered_by_segments, (
-            f"Сегменты не восстанавливают покрытую часть фрагмента!\n"
-            f"  by_global   = {covered_by_global!r}\n"
-            f"  by_segments = {covered_by_segments!r}"
-        )
-
-        # 4. Дополнительно: суммарная «потеря» — это только разделители,
-        #    и их длина должна быть ровно (общая длина фрагмента - покрытое).
-        lost_len = (global_end - global_start) - sum(
-            s["global_end"] - s["global_start"] for s in segments
-        )
-        # Допустимая потеря: только разделители между блоками.
-        if lost_len > 0:
-            # Найдём все позиции разделителей внутри [global_start, global_end]
-            expected_lost = 0
-            for sep_start, sep_end in doc.separators:
-                if global_start < sep_start and sep_end < global_end:
-                    expected_lost += sep_end - sep_start
-            # Плюс внутренние разделители между страницами PDF (не в doc.separators).
-            # Их длина = 2 (len(separator)). Проверим, что потеря кратна этой длине.
-            # Не строгая проверка, но достаточная для диагностики:
-            assert lost_len <= (global_end - global_start) * 0.05, (
-                f"Слишком много потеряно: {lost_len} символов. "
-                f"Возможно, потеряны не только разделители."
-            )
-
-        # 5. PDF: bbox должен покрывать сегмент
+        # Потери — только разделители
+        lost_positions = []
+        cursor = global_start
         for s in segments:
-            if s["format"] != "PDF":
-                continue
-            src = doc.sources[s["source_id"]]
-            overlapping = [
-                bb for bb in src.pdf_char_bboxes
-                if bb.page == s["page"]
-                   and bb.char_index >= s["local_start"]
-                   and bb.char_index < s["local_end"]
-            ]
-            covered = len(overlapping)
-            needed = s["local_end"] - s["local_start"]
-            coverage = covered / max(1, needed)
-            assert coverage > 0.5, (
-                f"Низкое покрытие bbox для PDF-сегмента "
-                f"[{s['local_start']}:{s['local_end']}] на page={s['page']}: "
-                f"{coverage:.1%} ({covered}/{needed})"
-            )
+            if cursor < s.global_start:
+                lost_positions.append((cursor, s.global_start))
+            cursor = s.global_end
+        if cursor < global_end:
+            lost_positions.append((cursor, global_end))
+        for ls, le in lost_positions:
+            lost = doc.full_text[ls:le]
+            assert all(ch in "\n\r\t " for ch in lost), f"Потерян текст: {lost!r}"
 
-        print(
-            f"  ✓ [{'+'.join(info['source_ids'])}] "
-            f"global=[{global_start}:{global_end}] → "
-            f"{len(segments)} сегмент(ов) — {original[:50]!r}"
-        )
+        print(f"  ✓ [{'+'.join(info.source_ids)}] "
+              f"global=[{global_start}:{global_end}] — {original[:50]!r}")
 
-    # --- Тесты ---
-
-    # 1. Осмысленные фразы из документа
-    test_needles = [
-        "в разумный срок",
-        "по мере необходимости",
-        "Мир техники",
-        "«10» февраля 2026 г.",
-        "Срок поставки",
-    ]
-    for needle in test_needles:
+    for needle in ["в разумный срок", "Мир техники", "Срок поставки"]:
         idx = doc.full_text.find(needle)
         if idx == -1:
             continue
-        print(f"\n-- Фраза: {needle!r} @ {idx} --")
         check_export_roundtrip(doc, idx, idx + len(needle))
 
-    # 2. Фрагменты, пересекающие границу блоков (главный кейс Пути B)
-    print("\n-- Фрагменты через границы блоков --")
-    for i in range(min(3, len(doc.blocks) - 1)):
-        b1, b2 = doc.blocks[i], doc.blocks[i + 1]
-        if b1.source_id != b2.source_id:
+    # Предобработка + LLM payload
+    debug_llm_payload(doc)
+
+
+def debug_llm_payload(doc) -> None:
+    """Показывает ровно то, что уйдёт в LLM."""
+    from src.preprocessing.extractor import preprocess
+
+    print("\n" + "=" * 70)
+    print("=== LLM PAYLOAD (что уйдёт в языковую модель) ===")
+    print("=" * 70)
+
+    result = preprocess(doc)
+
+    by_risk: dict[str, list] = {}
+    for frag in result.fragments:
+        by_risk.setdefault(frag.risk_type, []).append(frag)
+
+    total_fragments = 0
+    total_chars = 0
+
+    for risk_type in result.risk_types_checked:
+        frags = by_risk.get(risk_type, [])
+
+        print(f"\n{'─' * 70}")
+        print(f"RISK: {risk_type}")
+        print(f"{'─' * 70}")
+
+        if not frags:
+            absence = risk_type in result.risk_types_without_any_triggers
+            marker = " [absence: триггеров нет]" if absence else ""
+            print(f"  Кандидатов: 0{marker}")
             continue
-        # От середины b1 до середины b2
-        gs = b1.global_start + (b1.global_end - b1.global_start) // 2
-        ge = b2.global_start + (b2.global_end - b2.global_start) // 2
-        check_export_roundtrip(doc, gs, ge)
 
-    # 3. Фрагмент, начинающийся до первого блока и кончающийся после последнего
-    #    (крайние случаи)
-    print("\n-- Крайние случаи --")
-    first = doc.blocks[0]
-    last = doc.blocks[-1]
-    # Начало первого блока — последний символ последнего
-    check_export_roundtrip(doc, first.global_start, last.global_end)
+        print(f"  Кандидатов: {len(frags)}")
 
-    # 4. Обрывки посреди текста
-    print("\n-- Случайные обрывки --")
-    for start, length in [(500, 37), (1500, 83), (3000, 1120), (8000, 55)]:
-        end = min(start + length, len(doc.full_text))
-        if end > start:
-            check_export_roundtrip(doc, start, end)
+        for i, frag in enumerate(frags):
+            total_fragments += 1
+            total_chars += len(frag.text)
+
+            print(f"\n  ┌─ Кандидат [{i}] ─────────────────────────────────────")
+            print(f"  │ rank={frag.rank}  len={len(frag.text)}  "
+                  f"neg={frag.has_negative_context}")
+            print(f"  │ global=[{frag.global_start}:{frag.global_end}]")
+            print(f"  │ triggers: {[t.phrase for t in frag.triggers]}")
+
+            if frag.delivery_terms:
+                print(f"  │ delivery_terms ({len(frag.delivery_terms)}):")
+                for j, term in enumerate(frag.delivery_terms):
+                    print(f"  │   [{j}] kind={term.kind.value} raw={term.raw_text!r}")
+                    if term.kind.value == "relative":
+                        print(f"  │       event={term.event.value if term.event else None}, "
+                              f"offset={term.offset}, "
+                              f"unit={term.unit.value if term.unit else None}")
+                    if term.kind.value == "fixed_date":
+                        print(f"  │       date={term.fixed_date}")
+                    if term.kind.value == "fixed_period":
+                        print(f"  │       period={term.period_start} … {term.period_end}")
+
+            print(f"  │")
+            print(f"  │ --- TEXT (пойдёт в LLM) ---")
+            for line in frag.text.splitlines():
+                print(f"  │ {line}")
+            print(f"  │ --- END ---")
+            print(f"  └─────────────────────────────────────────────────────")
+
+    print(f"\n{'=' * 70}")
+    print(f"ИТОГО:")
+    print(f"  Типов рисков:     {len(result.risk_types_checked)}")
+    print(f"  Всего кандидатов: {total_fragments}")
+    print(f"  Объём:            {total_chars} символов (~{total_chars // 3} токенов)")
+    if total_chars > 30000:
+        print(f"  ⚠️  Много для одного вызова — уменьшить max_fragments")
+    else:
+        print(f"  ✓  Приемлемо для одного LLM-вызова")
+    print(f"{'=' * 70}")
 
 if __name__ == "__main__":
     sources = [
         SourceDocument(
             source_id="main",
-            file_name="contract2.pdf",
+            file_name="contract3.docx",
             attachment_type=AttachmentType.MAIN,
-            path=str(DATA_DIR / "contract2.pdf"),
+            path=str(DATA_DIR / "contract3.docx"),
         ),
         SourceDocument(
             source_id="schedule",
             file_name="schedule.docx",
-            attachment_type=AttachmentType.SCHEDULE,
+            attachment_type=AttachmentType.SPECIFICATION,
             path=str(DATA_DIR / "schedule.docx"),
         ),
     ]

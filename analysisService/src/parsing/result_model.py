@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from src.parsing.models import DocumentFormat, ParsedSource, TextBlock
+from src.contracts.export import ExportInfo, ExportSegment
 
 @dataclass
 class ParsedDocument:
@@ -27,7 +28,7 @@ class ParsedDocument:
         result.sort(key=lambda b: b.global_start)
         return result
 
-    def export_info(self, global_start: int, global_end: int) -> dict | None:
+    def export_info(self, global_start: int, global_end: int) -> ExportInfo | None:
         if global_start >= global_end:
             return None
 
@@ -35,7 +36,7 @@ class ParsedDocument:
         if not overlapping:
             return None
 
-        segments: list[dict] = []
+        segments: list[ExportSegment] = []
         seen_sources: set[str] = set()
 
         for block in overlapping:
@@ -51,37 +52,36 @@ class ParsedDocument:
             local_start = block.local_start + (seg_start - block.global_start)
             local_end = block.local_start + (seg_end - block.global_start)
 
-            segment: dict = {
-                "source_id": block.source_id,
-                "format": source.format.value,
-                "local_start": local_start,
-                "local_end": local_end,
-                "global_start": seg_start,
-                "global_end": seg_end,
-            }
+            seg = ExportSegment(
+                source_id=block.source_id,
+                format=source.format,
+                local_start=local_start,
+                local_end=local_end,
+                global_start=seg_start,
+                global_end=seg_end,
+            )
 
             if source.format == DocumentFormat.DOCX:
-                segment["paragraph"] = block.paragraph
-                segment["table"] = block.table
-                segment["row"] = block.row
-            else:
-                segment["page"] = block.page
+                seg.paragraph = block.paragraph
+                seg.table = block.table
+                seg.row = block.row
+            else:  # PDF
+                seg.page = block.page
                 if block.pdf_char_offset_start is not None:
-                    segment["pdf_char_offset_start"] = (
-                            block.pdf_char_offset_start + (seg_start - block.global_start)
+                    seg.pdf_char_offset_start = (
+                        block.pdf_char_offset_start + (seg_start - block.global_start)
                     )
-                if block.pdf_char_offset_end is not None:
-                    segment["pdf_char_offset_end"] = (
-                            block.pdf_char_offset_start + (seg_end - block.global_start)
+                    seg.pdf_char_offset_end = (
+                        block.pdf_char_offset_start + (seg_end - block.global_start)
                     )
 
-            segments.append(segment)
+            segments.append(seg)
             seen_sources.add(block.source_id)
 
         if not segments:
             return None
 
-        return {
-            "segments": segments,
-            "source_ids": sorted(seen_sources),
-        }
+        return ExportInfo(
+            segments=segments,
+            source_ids=sorted(seen_sources),
+        )
