@@ -12,10 +12,7 @@ from src.preprocessing.terms_extractor import extract_delivery_terms
 from src.preprocessing.triggers import RISK_TRIGGERS, RiskTriggerConfig
 
 
-def preprocess(
-    doc: ParsedDocument,
-    configs: list[RiskTriggerConfig] | None = None,
-) -> PreprocessingResult:
+def preprocess(doc: ParsedDocument, configs: list[RiskTriggerConfig] | None = None,) -> PreprocessingResult:
     configs = configs or RISK_TRIGGERS
     full_text = doc.full_text
 
@@ -24,7 +21,6 @@ def preprocess(
     for cfg in configs:
         result.risk_types_checked.append(cfg.risk_type)
 
-        # 1. Позитивные триггеры (подстроки, whitespace-толерантные)
         positive_matches: list[TriggerMatch] = []
         for phrase in cfg.positive_triggers:
             for m_start, m_end in _find_phrase_matches(full_text, phrase):
@@ -36,7 +32,6 @@ def preprocess(
                     is_negative=False,
                 ))
 
-        # 2. Позитивные триггеры (regex)
         for pattern in cfg.positive_patterns:
             for m in re.finditer(pattern, full_text, flags=re.IGNORECASE):
                 positive_matches.append(TriggerMatch(
@@ -47,7 +42,6 @@ def preprocess(
                     is_negative=False,
                 ))
 
-        # 3. Негативные триггеры (regex)
         negative_matches: list[TriggerMatch] = []
         for pattern in cfg.negative_patterns:
             for m in re.finditer(pattern, full_text, flags=re.IGNORECASE):
@@ -67,11 +61,9 @@ def preprocess(
                 result.risk_types_without_any_triggers.append(cfg.risk_type)
             continue
 
-        # 4. Окна и их слияние
         windows = _build_windows(full_text, positive_matches, cfg)
         merged = _merge_windows(windows)
 
-        # 5. Для каждого окна — извлекаем сроки + создаём фрагмент
         fragments: list[CandidateFragment] = []
         for start, end, triggers in merged:
             has_neg = any(
@@ -92,7 +84,6 @@ def preprocess(
             )
             fragments.append(frag)
 
-        # 6. Ранжирование
         for frag in fragments:
             frag.rank = (
                 len(frag.triggers) * 10
@@ -110,13 +101,6 @@ def preprocess(
 
 
 def _find_phrase_matches(text: str, phrase: str) -> list[tuple[int, int]]:
-    """Ищет фразу, игнорируя различия в пробелах и переносах.
-
-    «с момента оплаты» найдёт и «с момента оплаты»,
-    и «с \\nмомента оплаты», и «с\\xa0момента оплаты».
-
-    Возвращает список пар (start, end) в координатах `text`.
-    """
     parts = phrase.split()
     if not parts:
         return []

@@ -9,10 +9,10 @@ class RiskTriggerConfig:
     positive_triggers: list[str] = field(default_factory=list)
     positive_patterns: list[str] = field(default_factory=list)
     negative_patterns: list[str] = field(default_factory=list)
-    context_before: int = 125
+    context_before: int = 115
     context_after: int = 225
     is_absence_risk: bool = False
-    max_fragments: int = 4
+    max_fragments: int = 3
 
 
 @dataclass

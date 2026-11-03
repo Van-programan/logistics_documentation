@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from enum import Enum
 
 
 class DeliveryTermKind(str, Enum):
-    FIXED_DATE = "fixed_date"      # «не позднее 15.02.2026»
-    FIXED_PERIOD = "fixed_period"  # «с 01.03.2026 по 15.03.2026»
-    RELATIVE = "relative"          # «10 рабочих дней с момента оплаты»
-    VAGUE = "vague"                # «в разумный срок» — данных нет
-    ABSENT = "absent"              # срок не указан вообще
+    FIXED_DATE = "fixed_date"
+    FIXED_PERIOD = "fixed_period"
+    RELATIVE = "relative"
+    VAGUE = "vague"
+    ABSENT = "absent"
 
 
 class RelativeEvent(str, Enum):
@@ -30,46 +30,33 @@ class TimeUnit(str, Enum):
 
 @dataclass
 class DeliveryTerm:
-    """Один срок поставки, извлечённый из текста.
-
-    На один фрагмент может приходиться несколько сроков
-    (разные партии, способы доставки и т.д.).
-    """
     kind: DeliveryTermKind
     raw_text: str
 
-    # FIXED_DATE
     fixed_date: date | None = None
 
-    # FIXED_PERIOD
     period_start: date | None = None
     period_end: date | None = None
 
-    # RELATIVE
     event: RelativeEvent | None = None
     offset: int | None = None
     unit: TimeUnit | None = None
 
-    # Контекст (для будущего): «самовывоз» / «доставка поставщиком» / «партия №1»
     context: str | None = None
 
     def is_resolvable(self) -> bool:
-        """Можно ли вычислить дату дедлайна без ввода юриста."""
         if self.kind == DeliveryTermKind.FIXED_DATE:
             return self.fixed_date is not None
         if self.kind == DeliveryTermKind.FIXED_PERIOD:
             return self.period_end is not None
+        if self.kind == DeliveryTermKind.RELATIVE:
+            return self.event is not None and self.offset is not None and self.unit is not None
         return False
 
     def resolve_deadline(
         self,
         event_dates: dict[RelativeEvent, date],
     ) -> date | None:
-        """Вычисляет дату дедлайна, если известны даты событий.
-
-        Для production: праздники РФ (библиотека `holidays`) и
-        точные месяцы (dateutil.relativedelta).
-        """
         if self.kind == DeliveryTermKind.FIXED_DATE:
             return self.fixed_date
         if self.kind == DeliveryTermKind.FIXED_PERIOD:
@@ -88,7 +75,6 @@ class DeliveryTerm:
         if self.unit == TimeUnit.CALENDAR:
             return event_date + timedelta(days=self.offset)
 
-        # WORKING / BANKING — пропускаем субботу и воскресенье
         current = event_date
         added = 0
         while added < self.offset:
@@ -96,3 +82,79 @@ class DeliveryTerm:
             if current.weekday() < 5:
                 added += 1
         return current
+
+
+    def to_export_dict(self) -> dict:
+        if self.kind == DeliveryTermKind.RELATIVE:
+            return {
+                "kind": "relative",
+                "event": self.event.value if self.event else None,
+                "offset": self.offset,
+                "unit": self.unit.value if self.unit else None,
+            }
+        if self.kind == DeliveryTermKind.FIXED_DATE:
+            return {
+                "kind": "fixed_date",
+                "date": self.fixed_date.isoformat() if self.fixed_date else None,
+            }
+        if self.kind == DeliveryTermKind.FIXED_PERIOD:
+            return {
+                "kind": "fixed_period",
+                "start": self.period_start.isoformat() if self.period_start else None,
+                "end": self.period_end.isoformat() if self.period_end else None,
+            }
+        if self.kind == DeliveryTermKind.VAGUE:
+            return {"kind": "vague"}
+        return {"kind": "absent"}
+
+    @classmethod
+    def from_export_dict(cls, data: dict) -> "DeliveryTerm | None":
+        kind = data.get("kind")
+
+        if kind == "relative":
+            try:
+                return cls(
+                    kind=DeliveryTermKind.RELATIVE,
+                    raw_text="[confirmed by LLM]",
+                    event=RelativeEvent(data["event"]),
+                    offset=int(data["offset"]),
+                    unit=TimeUnit(data["unit"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        if kind == "fixed_date":
+            d = _parse_iso_date(data.get("date"))
+            if d is None:
+                return None
+            return cls(
+                kind=DeliveryTermKind.FIXED_DATE,
+                raw_text="[confirmed by LLM]",
+                fixed_date=d,
+            )
+
+        if kind == "fixed_period":
+            start = _parse_iso_date(data.get("start"))
+            end = _parse_iso_date(data.get("end"))
+            if end is None:
+                return None
+            return cls(
+                kind=DeliveryTermKind.FIXED_PERIOD,
+                raw_text="[confirmed by LLM]",
+                period_start=start,
+                period_end=end,
+            )
+
+        if kind == "vague":
+            return cls(kind=DeliveryTermKind.VAGUE, raw_text="[confirmed by LLM]")
+
+        return None
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None

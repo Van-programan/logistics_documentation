@@ -10,7 +10,6 @@ from src.preprocessing.delivery_term import (
     TimeUnit,
 )
 
-
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
@@ -32,8 +31,37 @@ _W1 = r"[\s\xa0\u2009\u202f]+"
 _GAP = r"[\s\S]{0,80}?"
 _GAP_SMALL = r"[\s\S]{0,20}?"
 
+_GAP_NUM_UNIT = r"(?:(?!%|(?:\d+\s*дн))[\s\S]){0,30}?"
+_DAYS_PREFIX = rf"(?:в{_W1}течение|не{_W1}позднее|в{_W1}срок|через)"
+_UNIT_GROUP = rf"(?:(?P<unit>рабочих|календарных|банковских){_W1})?"
+_UNIT_FROM_RAW_RE = re.compile(
+    r"\b(рабочих|рабочий|календарных|календарный|банковских|банковский)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _unit_from_raw(raw: str, fallback: TimeUnit) -> TimeUnit:
+    m = _UNIT_FROM_RAW_RE.search(raw)
+    if m:
+        return UNIT_MAP.get(m.group(1).lower(), fallback)
+    return fallback
+
+
+def _is_suspicious_term(m: re.Match, days: int) -> bool:
+    if days > 365:
+        return True
+    try:
+        prefix = m.group(0)[: m.start("days") - m.start()]
+    except (IndexError, ValueError):
+        prefix = ""
+    if "%" in prefix:
+        return True
+    if m.group("unit") is None and days > 60:
+        return True
+    return False
+
+
 def extract_delivery_terms(text: str) -> list[DeliveryTerm]:
-    """Извлекает все сроки поставки из текста."""
     terms: list[DeliveryTerm] = []
     terms.extend(_extract_fixed_dates(text))
     terms.extend(_extract_periods(text))
@@ -42,12 +70,8 @@ def extract_delivery_terms(text: str) -> list[DeliveryTerm]:
     return terms
 
 
-# ---------- FIXED DATES ----------
-
 _FIXED_DATE_PATTERNS = [
-    # «не позднее 15.02.2026», «в срок до 15.02.2026»
     rf"(?:не{_W1}позднее|в{_W1}срок{_W1}до|в{_W1}срок){_W1}(?P<d>\d{{1,2}}[./]\d{{1,2}}[./]\d{{2,4}})",
-    # «15 февраля 2026 г.»
     rf"(?P<d>\d{{1,2}}{_W1}(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря){_W1}\d{{4}})",
 ]
 
@@ -69,8 +93,6 @@ def _extract_fixed_dates(text: str) -> list[DeliveryTerm]:
             ))
     return terms
 
-
-# ---------- FIXED PERIODS ----------
 
 _PERIOD_PATTERN = (
     rf"с{_W1}(?P<start>\d{{1,2}}[./]\d{{1,2}}[./]\d{{2,4}}){_W1}по{_W1}"
@@ -94,102 +116,55 @@ def _extract_periods(text: str) -> list[DeliveryTerm]:
     return terms
 
 
-# ---------- RELATIVE ----------
+_DAYS_UNIT = (
+    rf"{_DAYS_PREFIX}{_W1}(?P<days>\d+){_GAP_NUM_UNIT}"
+    rf"{_UNIT_GROUP}"
+    rf"дн\w*"
+)
 
 _RELATIVE_PATTERNS: list[tuple[str, RelativeEvent]] = [
-    # «в течение N [рабочих] дней … с момента оплаты»
     (
-        rf"в{_W1}течение{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:пред)?оплаты",
         RelativeEvent.PAYMENT_DATE,
     ),
-    # «через N дней … после оплаты»
     (
-        rf"через{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:пред)?оплаты",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    # «в течение N дней … с момента поступления денежных средств»
-    (
-        rf"в{_W1}течение{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
         RelativeEvent.PAYMENT_DATE,
     ),
-    # «не позднее N дней … с момента поступления денежных средств»
     (
-        rf"не{_W1}позднее{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    # «N дней … с даты поступления денежных средств»
-    (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}даты{_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
         RelativeEvent.PAYMENT_DATE,
     ),
-    # «не позднее N дней … с момента оплаты»
     (
-        rf"не{_W1}позднее{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:пред)?оплаты",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    # «N дней … с даты оплаты»
-    (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}даты{_W1}(?:пред)?оплаты",
         RelativeEvent.PAYMENT_DATE,
     ),
-    # «N дней … с даты выставления счёта»
     (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}даты{_W1}выставления{_W1}сч[её]та",
         RelativeEvent.INVOICE_DATE,
     ),
-    # «в течение N дней … с момента выставления счёта»
     (
-        rf"в{_W1}течение{_W1}(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"(?:с{_W1}момента|после){_W1}выставления{_W1}сч[её]та",
         RelativeEvent.INVOICE_DATE,
     ),
-    # «N дней … с момента подписания договора»
     (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}(?:момента|даты){_W1}подписания{_W1}договора",
         RelativeEvent.CONTRACT_SIGNING_DATE,
     ),
-    # «N дней … с момента подписания спецификации/заявки»
     (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}(?:момента|даты){_W1}подписания{_W1}(?:спецификации|заявки)",
         RelativeEvent.SPEC_SIGNING_DATE,
     ),
-    # «N дней … с момента приёмки предыдущей партии»
     (
-        rf"(?P<days>\d+){_GAP_SMALL}"
-        rf"(?P<unit>рабочих|календарных|банковских)?{_GAP_SMALL}дн\w*"
-        rf"{_GAP_SMALL}"
+        rf"{_DAYS_UNIT}{_GAP_SMALL}"
         rf"с{_W1}(?:момента|даты){_W1}(?:приемки|приёмки){_W1}(?:предыдущей{_W1})?партии",
         RelativeEvent.ACCEPTANCE_DATE,
     ),
@@ -204,11 +179,19 @@ def _extract_relative(text: str) -> list[DeliveryTerm]:
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             if any(s <= m.start() and m.end() <= e for s, e in matched_spans):
                 continue
+
             days = int(m.group("days"))
-            unit = UNIT_MAP.get(m.group("unit"))
+
+            if _is_suspicious_term(m, days):
+                continue
+
+            raw = m.group(0)
+            fallback = UNIT_MAP.get(m.group("unit"), TimeUnit.CALENDAR)
+            unit = _unit_from_raw(raw, fallback) if m.group("unit") is None else fallback
+
             terms.append(DeliveryTerm(
                 kind=DeliveryTermKind.RELATIVE,
-                raw_text=m.group(0),
+                raw_text=raw,
                 event=event,
                 offset=days,
                 unit=unit,
@@ -217,8 +200,6 @@ def _extract_relative(text: str) -> list[DeliveryTerm]:
 
     return terms
 
-
-# ---------- VAGUE ----------
 
 _VAGUE_PATTERNS = [
     rf"в{_W1}разумн\w+{_W1}срок",
@@ -246,8 +227,6 @@ def _extract_vague(text: str) -> list[DeliveryTerm]:
             ))
     return terms
 
-
-# ---------- PARSING ----------
 
 def _parse_date(s: str) -> date | None:
     s = s.strip()
