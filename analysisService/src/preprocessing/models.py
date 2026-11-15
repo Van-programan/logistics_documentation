@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from src.preprocessing.delivery_term import DeliveryTerm
 
 @dataclass
 class RiskTriggerConfig:
@@ -32,7 +31,6 @@ class CandidateFragment:
     text: str
     triggers: list[TriggerMatch] = field(default_factory=list)
     has_negative_context: bool = False
-    delivery_terms: list[DeliveryTerm] = field(default_factory=list)
     rank: int = 0
 
 

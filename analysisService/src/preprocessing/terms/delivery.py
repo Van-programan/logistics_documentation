@@ -1,14 +1,39 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 
-from src.preprocessing.delivery_term import (
-    DeliveryTerm,
-    DeliveryTermKind,
-    RelativeEvent,
-    TimeUnit,
-)
+from src.preprocessing.terms.base import DeliveryEvent, DeliverySubKind, ExtractedTerm, TermKind, TimeUnit
+
+
+@dataclass
+class DeliveryTerm:
+    kind: DeliverySubKind
+    raw_text: str
+
+    fixed_date: date | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+
+    event: DeliveryEvent | None = None
+    offset: int | None = None
+    unit: TimeUnit | None = None
+
+    context: str | None = None
+
+    def to_extracted(self) -> ExtractedTerm:
+        return ExtractedTerm(
+            kind=TermKind.DELIVERY,
+            raw_text=self.raw_text,
+            sub_kind=self.kind,
+            event=self.event.value if self.event else None,
+            offset=self.offset,
+            unit=self.unit,
+            fixed_date=self.fixed_date,
+            period_start=self.period_start,
+            period_end=self.period_end,
+        )
 
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
@@ -16,7 +41,7 @@ MONTHS_RU = {
     "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
 
-UNIT_MAP: dict[str | None, TimeUnit] = {
+_UNIT_MAP: dict[str | None, TimeUnit] = {
     "рабочих": TimeUnit.WORKING,
     "рабочий": TimeUnit.WORKING,
     "календарных": TimeUnit.CALENDAR,
@@ -30,7 +55,6 @@ _W = r"[\s\xa0\u2009\u202f]*"
 _W1 = r"[\s\xa0\u2009\u202f]+"
 _GAP = r"[\s\S]{0,80}?"
 _GAP_SMALL = r"[\s\S]{0,20}?"
-
 _GAP_NUM_UNIT = r"(?:(?!%|(?:\d+\s*дн))[\s\S]){0,30}?"
 _DAYS_PREFIX = rf"(?:в{_W1}течение|не{_W1}позднее|в{_W1}срок|через)"
 _UNIT_GROUP = rf"(?:(?P<unit>рабочих|календарных|банковских){_W1})?"
@@ -43,7 +67,7 @@ _UNIT_FROM_RAW_RE = re.compile(
 def _unit_from_raw(raw: str, fallback: TimeUnit) -> TimeUnit:
     m = _UNIT_FROM_RAW_RE.search(raw)
     if m:
-        return UNIT_MAP.get(m.group(1).lower(), fallback)
+        return _UNIT_MAP.get(m.group(1).lower(), fallback)
     return fallback
 
 
@@ -87,7 +111,7 @@ def _extract_fixed_dates(text: str) -> list[DeliveryTerm]:
                 continue
             seen.add(d)
             terms.append(DeliveryTerm(
-                kind=DeliveryTermKind.FIXED_DATE,
+                kind=DeliverySubKind.FIXED_DATE,
                 raw_text=raw,
                 fixed_date=d,
             ))
@@ -108,7 +132,7 @@ def _extract_periods(text: str) -> list[DeliveryTerm]:
         if start is None or end is None:
             continue
         terms.append(DeliveryTerm(
-            kind=DeliveryTermKind.FIXED_PERIOD,
+            kind=DeliverySubKind.FIXED_PERIOD,
             raw_text=m.group(0),
             period_start=start,
             period_end=end,
@@ -122,52 +146,25 @@ _DAYS_UNIT = (
     rf"дн\w*"
 )
 
-_RELATIVE_PATTERNS: list[tuple[str, RelativeEvent]] = [
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:пред)?оплаты",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}даты{_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}даты{_W1}(?:пред)?оплаты",
-        RelativeEvent.PAYMENT_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}даты{_W1}выставления{_W1}сч[её]та",
-        RelativeEvent.INVOICE_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"(?:с{_W1}момента|после){_W1}выставления{_W1}сч[её]та",
-        RelativeEvent.INVOICE_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}(?:момента|даты){_W1}подписания{_W1}договора",
-        RelativeEvent.CONTRACT_SIGNING_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}(?:момента|даты){_W1}подписания{_W1}(?:спецификации|заявки)",
-        RelativeEvent.SPEC_SIGNING_DATE,
-    ),
-    (
-        rf"{_DAYS_UNIT}{_GAP_SMALL}"
-        rf"с{_W1}(?:момента|даты){_W1}(?:приемки|приёмки){_W1}(?:предыдущей{_W1})?партии",
-        RelativeEvent.ACCEPTANCE_DATE,
-    ),
+_RELATIVE_PATTERNS: list[tuple[str, DeliveryEvent]] = [
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:пред)?оплаты",
+     DeliveryEvent.PAYMENT_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}(?:с{_W1}момента|после|со{_W1}дня){_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
+     DeliveryEvent.PAYMENT_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}даты{_W1}(?:поступления|зачисления){_W1}денежных{_W1}средств",
+     DeliveryEvent.PAYMENT_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}даты{_W1}(?:пред)?оплаты",
+     DeliveryEvent.PAYMENT_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}даты{_W1}выставления{_W1}сч[её]та",
+     DeliveryEvent.INVOICE_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}(?:с{_W1}момента|после){_W1}выставления{_W1}сч[её]та",
+     DeliveryEvent.INVOICE_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}(?:момента|даты){_W1}подписания{_W1}договора",
+     DeliveryEvent.CONTRACT_SIGNING_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}(?:момента|даты){_W1}подписания{_W1}(?:спецификации|заявки)",
+     DeliveryEvent.SPEC_SIGNING_DATE),
+    (rf"{_DAYS_UNIT}{_GAP_SMALL}с{_W1}(?:момента|даты){_W1}(?:приемки|приёмки){_W1}(?:предыдущей{_W1})?партии",
+     DeliveryEvent.ACCEPTANCE_DATE),
 ]
 
 
@@ -179,18 +176,15 @@ def _extract_relative(text: str) -> list[DeliveryTerm]:
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             if any(s <= m.start() and m.end() <= e for s, e in matched_spans):
                 continue
-
             days = int(m.group("days"))
-
             if _is_suspicious_term(m, days):
                 continue
-
             raw = m.group(0)
-            fallback = UNIT_MAP.get(m.group("unit"), TimeUnit.CALENDAR)
+            fallback = _UNIT_MAP.get(m.group("unit"), TimeUnit.CALENDAR)
             unit = _unit_from_raw(raw, fallback) if m.group("unit") is None else fallback
 
             terms.append(DeliveryTerm(
-                kind=DeliveryTermKind.RELATIVE,
+                kind=DeliverySubKind.RELATIVE,
                 raw_text=raw,
                 event=event,
                 offset=days,
@@ -222,7 +216,7 @@ def _extract_vague(text: str) -> list[DeliveryTerm]:
                 continue
             seen_spans.add(key)
             terms.append(DeliveryTerm(
-                kind=DeliveryTermKind.VAGUE,
+                kind=DeliverySubKind.VAGUE,
                 raw_text=m.group(0),
             ))
     return terms

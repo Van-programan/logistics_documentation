@@ -8,18 +8,10 @@ from src.preprocessing.models import (
     PreprocessingResult,
     TriggerMatch,
 )
-from src.preprocessing.terms_extractor import extract_delivery_terms
 from src.preprocessing.triggers import RISK_TRIGGERS, RiskTriggerConfig
 
 
-# ============================================================
-# ОСНОВНАЯ ФУНКЦИЯ
-# ============================================================
-
-def preprocess(
-    doc: ParsedDocument,
-    configs: list[RiskTriggerConfig] | None = None,
-) -> PreprocessingResult:
+def preprocess(doc: ParsedDocument, configs: list[RiskTriggerConfig] | None = None) -> PreprocessingResult:
     configs = configs or RISK_TRIGGERS
     full_text = doc.full_text
 
@@ -28,7 +20,6 @@ def preprocess(
     for cfg in configs:
         result.risk_types_checked.append(cfg.risk_type)
 
-        # --- 1. Позитивные триггеры (подстроки) ---
         positive_matches: list[TriggerMatch] = []
         for phrase in cfg.positive_triggers:
             for m_start, m_end in _find_phrase_matches(full_text, phrase):
@@ -40,7 +31,6 @@ def preprocess(
                     is_negative=False,
                 ))
 
-        # --- 2. Позитивные триггеры (regex) ---
         for pattern in cfg.positive_patterns:
             for m in re.finditer(pattern, full_text, flags=re.IGNORECASE):
                 positive_matches.append(TriggerMatch(
@@ -51,7 +41,6 @@ def preprocess(
                     is_negative=False,
                 ))
 
-        # --- 3. Негативные триггеры (regex) ---
         negative_matches: list[TriggerMatch] = []
         for pattern in cfg.negative_patterns:
             for m in re.finditer(pattern, full_text, flags=re.IGNORECASE):
@@ -71,11 +60,9 @@ def preprocess(
                 result.risk_types_without_any_triggers.append(cfg.risk_type)
             continue
 
-        # --- 4. Окна и слияние ---
         windows = _build_windows(full_text, positive_matches, cfg)
         merged = _merge_windows(windows)
 
-        # --- 5. Фрагменты ---
         fragments: list[CandidateFragment] = []
         for start, end, triggers in merged:
             has_neg = any(
@@ -83,7 +70,6 @@ def preprocess(
                 for neg in negative_matches
             )
             window_text = full_text[start:end]
-            delivery_terms = extract_delivery_terms(window_text)
 
             frag = CandidateFragment(
                 risk_type=cfg.risk_type,
@@ -92,69 +78,52 @@ def preprocess(
                 text=window_text,
                 triggers=triggers,
                 has_negative_context=has_neg,
-                delivery_terms=delivery_terms,
             )
             fragments.append(frag)
 
-        # --- 6. Ранжирование ---
         for frag in fragments:
             frag.rank = (
                 len(frag.triggers) * 10
                 + (0 if frag.has_negative_context else 5)
                 - (0 if not frag.has_negative_context else 3)
-                + len(frag.delivery_terms) * 3
             )
+            if cfg.risk_type == "acceptance_missing" and _has_acceptance_term(frag.text):
+                frag.rank += 20
+            if cfg.risk_type == "auto_renewal" and _has_renewal_term(frag.text):
+                frag.rank += 20
 
         fragments.sort(key=lambda f: f.rank, reverse=True)
         fragments = fragments[:cfg.max_fragments]
 
         result.fragments.extend(fragments)
 
-    # --- 7. ЖЁСТКИЙ FALLBACK ДЛЯ ТАБЛИЧНЫХ РИСКОВ ---
     _force_add_table_to_risks(doc, result)
-
-    # --- 8. Дедупликация ---
     _deduplicate_fragments(result)
 
     return result
 
 
-# ============================================================
-# ЖЁСТКИЙ FALLBACK — ГАРАНТИРОВАННО ДОБАВЛЯЕТ ТАБЛИЦУ
-# ============================================================
-
 _TABLE_RISKS = {"quantity_undefined", "item_name_vague", "schedule_missing"}
 
 
 def _force_add_table_to_risks(doc: ParsedDocument, result: PreprocessingResult) -> None:
-    """Гарантированно добавляет фрагмент с таблицей в табличные риски.
-
-    Логика:
-      1. Ищем `|` (символ таблицы) в full_text.
-      2. Если нашли — вырезаем контекст ±2000 символов.
-      3. Для каждого табличного риска без табличного кандидата — добавляем этот кусок.
-    """
-    # 1. Ищем таблицу в full_text
-    pipe_idx = doc.full_text.find("|")
+    pipe_idx = _find_product_table(doc.full_text)
     if pipe_idx < 0:
-        return  # в тексте нет таблицы — fallback невозможен
+        return
 
-    # 2. Вырезаем контекст
     start = max(0, pipe_idx - 300)
     end = min(len(doc.full_text), pipe_idx + 3000)
     chunk = doc.full_text[start:end]
-
     if not chunk.strip():
         return
+    if not _is_product_table(chunk):
+        return
 
-    # 3. Для каждого табличного риска — проверяем, есть ли уже табличный фрагмент
     for risk_type in _TABLE_RISKS:
         existing = result.fragments_for(risk_type)
-        has_table = any("|" in f.text for f in existing)
-        if has_table:
+        if any("|" in f.text and _is_product_table(f.text) for f in existing):
             continue
 
-        # Проверяем, не добавлен ли уже этот чанк
         already_added = any(
             f.risk_type == risk_type
             and f.global_start == start
@@ -171,13 +140,40 @@ def _force_add_table_to_risks(doc: ParsedDocument, result: PreprocessingResult) 
             text=chunk,
             triggers=[],
             has_negative_context=False,
-            delivery_terms=extract_delivery_terms(chunk),
         ))
 
 
-# ============================================================
-# ДЕДУПЛИКАЦИЯ
-# ============================================================
+def _find_product_table(full_text: str) -> int:
+    for m in re.finditer(r"\|", full_text):
+        idx = m.start()
+        snippet = full_text[max(0, idx - 500):idx + 500]
+        if _is_product_table(snippet):
+            return idx
+    return -1
+
+
+def _is_product_table(text: str) -> bool:
+    if "|" not in text:
+        return False
+
+    lower = text.lower()
+
+    req_markers = ["инн", "кпп", "бик", "р/с", "к/с", "юридический адрес", "м.п.", "огрн"]
+    req_count = sum(1 for m in req_markers if m in lower)
+    if req_count >= 2:
+        return False
+
+    product_markers = [
+        r"\d+\s*(?:шт|штук|ед|м|кг|руб)",
+        r"кол-?во",
+        r"цена",
+        r"стоимость",
+        r"наименование",
+        r"артикул",
+        r"ед\.?\s*изм",
+    ]
+    return any(re.search(p, lower) for p in product_markers)
+
 
 def _deduplicate_fragments(result: PreprocessingResult) -> None:
     seen: set[tuple[str, int, int]] = set()
@@ -190,10 +186,6 @@ def _deduplicate_fragments(result: PreprocessingResult) -> None:
         unique.append(frag)
     result.fragments = unique
 
-
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ
-# ============================================================
 
 def _find_phrase_matches(text: str, phrase: str) -> list[tuple[int, int]]:
     parts = phrase.split()
@@ -250,3 +242,11 @@ def _snap_word_end(text, pos):
     while pos < len(text) and text[pos].isalnum():
         pos += 1
     return pos
+
+def _has_acceptance_term(text: str) -> bool:
+    from src.preprocessing.terms.acceptance import extract_acceptance_terms
+    return len(extract_acceptance_terms(text)) > 0
+
+def _has_renewal_term(text: str) -> bool:
+    from src.preprocessing.terms.renewal import extract_renewal_terms
+    return len(extract_renewal_terms(text)) > 0

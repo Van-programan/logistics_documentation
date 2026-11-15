@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from src.parsing.models import DocumentFormat, ParsedSource, TextBlock
-from src.contracts.export import ExportInfo, ExportSegment
+from src.parsing.models import ParsedSource, TextBlock
 
 @dataclass
 class ParsedDocument:
@@ -27,61 +26,3 @@ class ParsedDocument:
         ]
         result.sort(key=lambda b: b.global_start)
         return result
-
-    def export_info(self, global_start: int, global_end: int) -> ExportInfo | None:
-        if global_start >= global_end:
-            return None
-
-        overlapping = self.blocks_in_range(global_start, global_end)
-        if not overlapping:
-            return None
-
-        segments: list[ExportSegment] = []
-        seen_sources: set[str] = set()
-
-        for block in overlapping:
-            seg_start = max(global_start, block.global_start)
-            seg_end = min(global_end, block.global_end)
-            if seg_start >= seg_end:
-                continue
-
-            source = self.sources.get(block.source_id)
-            if source is None:
-                continue
-
-            local_start = block.local_start + (seg_start - block.global_start)
-            local_end = block.local_start + (seg_end - block.global_start)
-
-            seg = ExportSegment(
-                source_id=block.source_id,
-                format=source.format,
-                local_start=local_start,
-                local_end=local_end,
-                global_start=seg_start,
-                global_end=seg_end,
-            )
-
-            if source.format == DocumentFormat.DOCX:
-                seg.paragraph = block.paragraph
-                seg.table = block.table
-                seg.row = block.row
-            else:  # PDF
-                seg.page = block.page
-                if block.pdf_char_offset_start is not None:
-                    seg.pdf_char_offset_start = (
-                        block.pdf_char_offset_start + (seg_start - block.global_start)
-                    )
-                    seg.pdf_char_offset_end = (
-                        block.pdf_char_offset_start + (seg_end - block.global_start)
-                    )
-
-            segments.append(seg)
-            seen_sources.add(block.source_id)
-
-        if not segments:
-            return None
-
-        return ExportInfo(
-            segments=segments,
-            source_ids=sorted(seen_sources),
-        )
